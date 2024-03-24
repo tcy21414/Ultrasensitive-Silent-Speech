@@ -12,3 +12,5 @@ The Repo includes the following datasets:
 4.New User Generalization Test: This dataset contains signals of 5 commonly used words (included in Dataset1) collected from three new users, with 50 samples per class.
 
 5.Noise Injection Data: This dataset includes around five minutes of silent noise signals (containing physiological noises such as breathing and swallowing) recorded in the absence of speech.
+
+Use "Main Code" and make some minor adjustments on the input/output dimensions to play with the datasets
