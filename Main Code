@@ -1,0 +1,228 @@
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+
+sample_len=1500
+noise_len=165000
+
+# Load data
+df = pd.read_excel('') # Load dataset here
+
+# Split the data into features X and labels y
+X = df.iloc[:, :-1].values
+y = df.iloc[:, -1].values - 1 
+
+# Convert to PyTorch tensors
+X_tensor = torch.FloatTensor(X)
+y_tensor = torch.LongTensor(y)
+
+# Split into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(X_tensor, y_tensor, test_size=0.2, random_state=42)
+
+# Load noise CSV file
+noise_df = pd.read_csv('', header=None, encoding='UTF-16LE') # load "noise.csv" here
+
+# Extract noise (assuming the noise is after the comma)
+noise_df['Noise'] = noise_df[0].apply(lambda x: float(x.split(',')[1]) if len(x.split(',')) > 1 else None)
+
+# Store the noise in a single-column DataFrame
+noise_data = noise_df['Noise'].dropna().reset_index(drop=True)
+noise_data = torch.FloatTensor(noise_data.values)  # Convert to a float32 PyTorch Tensor
+
+def add_real_noise(data, noise_data):
+    noise_len = len(noise_data)
+    sample_len = data.shape[1]
+
+    # Randomly select a starting point for the noise
+    start_idx = np.random.randint(0, noise_len - sample_len)
+
+    # Extract the corresponding length of noise
+    selected_noise = noise_data[start_idx:start_idx + sample_len]  # Removed .values
+
+    # Ensure dimensions match and add the noise
+    if len(data.shape) == 2:
+        selected_noise = selected_noise.reshape(1, -1)
+    data += selected_noise
+
+    return data
+
+
+# Use the add_real_noise function for data augmentation
+X_train_noisy1 = add_real_noise(X_train.clone(), noise_data)
+X_train_noisy2 = add_real_noise(X_train.clone(), noise_data)
+X_train_noisy3 = add_real_noise(X_train.clone(), noise_data)
+X_train_noisy4 = add_real_noise(X_train.clone(), noise_data)
+
+X_train_augmented = torch.cat([X_train, X_train_noisy1, X_train_noisy2, X_train_noisy3, X_train_noisy4], 0)
+y_train_augmented = torch.cat([y_train, y_train, y_train, y_train, y_train], 0)
+
+train_dataset = TensorDataset(X_train_augmented, y_train_augmented)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+
+test_dataset = TensorDataset(X_test, y_test)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, downsample=None):
+        super(ResidualBlock, self).__init__()
+        padding = (kernel_size - 1) // 2  # This ensures the output has the same spatial dimensions as the input
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding=padding)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=padding)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample:
+            residual = self.downsample(x)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv1d(1, 64, 7, 2, 3)  # initial convolution
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.2)  # Adding Dropout layer
+        self.maxpool = nn.MaxPool1d(3, 2, 1)
+        
+        self.layer1 = self.make_layer(ResidualBlock, 64,  64, 3)
+        self.layer2 = self.make_layer(ResidualBlock, 64, 128, 4, stride=2)
+        self.layer3 = self.make_layer(ResidualBlock, 128, 256, 6, stride=2)
+        self.layer4 = self.make_layer(ResidualBlock, 256, 512, 3, stride=2)
+        self.layer5 = self.make_layer(ResidualBlock, 512, 256, 3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, 20)
+        
+    def make_layer(self, block, in_channels, out_channels, blocks, stride=1):
+        downsample = None
+        if (stride != 1) or (in_channels != out_channels):
+            downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels))
+        layers = []
+        layers.append(block(in_channels, out_channels, stride=stride, downsample=downsample))
+        for i in range(1, blocks):
+            layers.append(block(out_channels, out_channels))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = x.view(-1, 1, 1500)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+# Hyperparams
+device = torch.device("mps")
+model = Net().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.00003, weight_decay=1e-5)
+
+
+train_losses = []  
+
+min_loss_epochs = [] 
+min_loss_value = float('inf')  
+best_model_state = None 
+
+# Train model
+for epoch in range(100):  
+    model.train()
+    epoch_loss = 0.0
+    for i, (inputs, labels) in enumerate(train_loader):
+        inputs, labels = inputs.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+        
+    epoch_loss /= len(train_loader)
+    train_losses.append(epoch_loss)  
+    
+    # minimum 5 loss
+    min_loss_epochs.append(epoch_loss)
+    if len(min_loss_epochs) > 5:
+        min_loss_epochs.pop(0)  
+    
+    current_min_loss = min(min_loss_epochs)
+    
+    if current_min_loss < min_loss_value:
+        min_loss_value = current_min_loss
+        best_model_state = model.state_dict()  
+        
+    print(f'Epoch {epoch+1}, Loss: {epoch_loss}, Best Loss: {min_loss_value}')
+
+# load state_dict for testing
+model.load_state_dict(best_model_state)
+
+
+# loss-epoch figure
+plt.plot(range(1, len(train_losses) + 1), train_losses)
+plt.xlabel('Epoch')
+plt.ylabel('Train Loss')
+plt.title('Train Loss vs. Epoch')
+plt.show()
+
+# test model
+model.eval()
+y_true = []
+y_pred = []
+with torch.no_grad():
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = model(inputs)
+        _, predicted = torch.max(outputs.data, 1)
+        y_true.extend(labels.cpu().numpy())
+        y_pred.extend(predicted.cpu().numpy())
+
+# Acc demonstration
+total_correct = np.sum(np.array(y_true) == np.array(y_pred))
+total_samples = len(y_true)
+accuracy = (total_correct / total_samples) * 100
+print(f"Overall Accuracy: {accuracy:.2f}%")
+
+# Confusion Matrix 
+cm = confusion_matrix(y_true, y_pred)
+cm_percentage = (cm / cm.sum(axis=1)[:, np.newaxis]) * 100
+
+plt.figure(figsize=(12, 12))  # Set figure size
+
+sns.heatmap(cm_percentage, annot=True, cmap='Blues', fmt='.1f',
+            annot_kws={"size": 10})  # Modify annot_kws to set text size
+
+plt.title('Confusion Matrix (Percentages)', fontsize=16)  # You can also set the fontsize of title and labels
+plt.show()
+
+
+
